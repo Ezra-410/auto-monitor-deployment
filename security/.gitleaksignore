@@ -1,0 +1,9 @@
+# =============================================================================
+# Gitleaks approved exceptions (owned by the security team, THIS repo only).
+# Format: <commit>:<file>:<rule>:<line>   (fingerprint printed by gitleaks)
+# Every entry must be listed in docs/SECURITY-EXCEPTIONS.md with a reason.
+# =============================================================================
+# EXC-06 - RSA test key used only by JwtServiceTest (unit-test fixture, never
+#          used in any environment). Accepted risk; remediation planned:
+#          generate the key at test runtime and purge it from history.
+2a565ce30bc33cacd32f20e1820b384e425242fe:backend/src/test/java/com/monitor/backend/security/JwtServiceTest.java:private-key:63

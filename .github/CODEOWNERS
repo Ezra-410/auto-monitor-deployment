@@ -1,0 +1,7 @@
+# Every change to the delivery/deployment system needs the security owner.
+# Replace @Ezra-410 with the reviewer (classmate / lecturer) if you have one.
+*                @Ezra-410
+/.github/        @Ezra-410
+/security/       @Ezra-410
+/terraform/      @Ezra-410
+/deploy/         @Ezra-410

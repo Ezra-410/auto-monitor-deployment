@@ -1,0 +1,6 @@
+# =============================================================================
+# Trivy approved IMAGE vulnerability exceptions (security team owned).
+# One CVE per line WITH expiry date; reason + approver on the comment line.
+#   CVE-0000-00000 exp:2026-12-31
+#   # reason: ... - approved by @Ezra-410 on 2026-11-07
+# =============================================================================

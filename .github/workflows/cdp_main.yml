@@ -1,0 +1,77 @@
+# =============================================================================
+# CDP · MAIN  (Continuous DePloyment orchestrator)
+#
+#   1 Authorize ─────────────► 2 Deploy STAGING ─────► 3 Deploy PRODUCTION
+#   - run from main only?       (environment:            (environment: production
+#   - CDL run successful,        staging, own secrets)    = REQUIRED APPROVAL,
+#     from main?                                           main only, prod secrets)
+#   - every image digest has
+#     a valid signed attestation?
+#
+# A deployment can ONLY use images listed in the release manifest of a
+# successful CDL run. Nobody can type an arbitrary image name here.
+# =============================================================================
+name: CDP · main
+
+on:
+  workflow_dispatch:
+    inputs:
+      cdl_run_id:
+        description: "Run ID of a SUCCESSFUL 'CDL · main' run (release to deploy)"
+        required: true
+      target:
+        description: "How far to deploy"
+        type: choice
+        options: [staging, production]
+        default: staging
+      simulate_failure:
+        description: "SEC-10: break the deployment on purpose to test recovery"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Never run two deployments of the same target at the same time.
+concurrency:
+  group: cdp-${{ inputs.target }}
+  cancel-in-progress: false
+
+jobs:
+  authorize:
+    name: "1 · Authorize release"
+    uses: ./.github/workflows/cdp_authorize.yml
+    with:
+      cdl_run_id: ${{ inputs.cdl_run_id }}
+    permissions:
+      contents: read
+      actions: read      # read the CDL run + download its manifest
+      packages: read     # read image metadata from GHCR
+      attestations: read # verify signed provenance
+
+  deploy_staging:
+    name: "2 · Deploy staging"
+    needs: authorize
+    uses: ./.github/workflows/cdp_deploy.yml
+    with:
+      environment: staging
+      simulate_failure: ${{ inputs.simulate_failure }}
+    permissions:
+      contents: read
+      actions: read
+      packages: read
+    secrets: inherit # environment secrets resolve only inside the env-bound job
+
+  deploy_production:
+    name: "3 · Deploy production"
+    needs: deploy_staging
+    if: inputs.target == 'production'
+    uses: ./.github/workflows/cdp_deploy.yml
+    with:
+      environment: production
+      simulate_failure: false
+    permissions:
+      contents: read
+      actions: read
+      packages: read
+    secrets: inherit

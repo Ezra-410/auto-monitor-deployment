@@ -1,0 +1,99 @@
+# =============================================================================
+# CDL · MAIN  (Continuous DeLivery orchestrator)
+#
+# Lives in a SEPARATE repository from the application code. Developers of
+# auto-monitor can change their CI, but they cannot change these gates.
+#
+#   1 Verify source ──┬─► 2a Secret check ──────┐
+#   (CI green? on     └─► 2b Misconfig check ───┴─► 3 Build ─► Scan ─► Publish
+#    main?)               (Terraform + Docker)        image    (gate)  (main only)
+#                                                                      + sign
+#                                                                      + release manifest
+# =============================================================================
+name: CDL · main
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "auto-monitor branch or commit SHA to deliver"
+        required: true
+        default: main
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Deliveries never cancel each other half-way (no half-published release).
+concurrency:
+  group: cdl-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify_source:
+    name: "1 · Verify source"
+    uses: ./.github/workflows/cdl_verify_source.yml
+    with:
+      source_ref: ${{ inputs.source_ref || 'main' }}
+    secrets:
+      AUTO_MONITOR_PAT: ${{ secrets.AUTO_MONITOR_PAT }}
+
+  secret_check:
+    name: "2a · Secret check"
+    needs: verify_source
+    uses: ./.github/workflows/cdl_secret_check.yml
+    with:
+      source_sha: ${{ needs.verify_source.outputs.source_sha }}
+    secrets:
+      AUTO_MONITOR_PAT: ${{ secrets.AUTO_MONITOR_PAT }}
+
+  misconfig_check:
+    name: "2b · Misconfiguration check"
+    needs: verify_source
+    uses: ./.github/workflows/cdl_misconfig_check.yml
+    with:
+      source_sha: ${{ needs.verify_source.outputs.source_sha }}
+    secrets:
+      AUTO_MONITOR_PAT: ${{ secrets.AUTO_MONITOR_PAT }}
+
+  build_scan_publish:
+    name: "3 · Build, scan & publish"
+    needs: [verify_source, secret_check, misconfig_check]
+    uses: ./.github/workflows/cdl_build_scan_publish.yml
+    with:
+      source_sha: ${{ needs.verify_source.outputs.source_sha }}
+      # Publish ONLY: source commit is on auto-monitor main AND this delivery
+      # pipeline runs from its own main branch AND it is not a pull request.
+      publish: ${{ needs.verify_source.outputs.on_main == 'true' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
+    permissions:
+      contents: read
+      packages: write     # push to GitHub Container Registry
+      id-token: write     # OIDC token used to sign the provenance attestation
+      attestations: write # store the signed attestation
+    secrets:
+      AUTO_MONITOR_PAT: ${{ secrets.AUTO_MONITOR_PAT }}
+
+  # Single, stable status check used by branch protection ("CDL gate").
+  gate:
+    name: CDL gate
+    needs: [verify_source, secret_check, misconfig_check, build_scan_publish]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: All delivery gates passed?
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+          PUBLISH: ${{ needs.verify_source.outputs.on_main == 'true' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
+        run: |
+          echo "Results: $RESULTS (publish=$PUBLISH)"
+          for r in $RESULTS; do
+            if [ "$r" != "success" ]; then
+              echo "::error::Delivery BLOCKED - a security gate failed ($RESULTS)"
+              exit 1
+            fi
+          done
+          echo "Delivery gates passed"

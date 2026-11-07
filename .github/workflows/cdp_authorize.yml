@@ -1,0 +1,96 @@
+# =============================================================================
+# CDP · Stage 1 · AUTHORIZE
+#   SEC-05  deployment started from a branch other than main  -> REJECTED
+#   SEC-09  release not produced by a successful CDL run on main,
+#           or image digest without a valid signed attestation -> REJECTED
+# Output: "approved-manifest" artifact = the exact digests allowed to deploy.
+# =============================================================================
+name: CDP · authorize
+
+on:
+  workflow_call:
+    inputs:
+      cdl_run_id:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  authorize:
+    name: Branch + release + signature checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      packages: read
+      attestations: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CDL_RUN_ID: ${{ inputs.cdl_run_id }}
+    steps:
+      - name: "Rule 1 - deployments may only be started from main"
+        run: |
+          if [ "${GITHUB_REF}" != "refs/heads/main" ]; then
+            echo "::error::REJECTED - deployment requested from ${GITHUB_REF}. Only refs/heads/main may deploy."
+            exit 1
+          fi
+          echo "OK - started from main by @${GITHUB_ACTOR}"
+
+      - name: "Rule 2 - the release comes from a successful CDL run on main"
+        run: |
+          case "$CDL_RUN_ID" in (*[!0-9]*|'') echo "::error::cdl_run_id must be a number"; exit 1;; esac
+          info=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${CDL_RUN_ID}" \
+                 --jq '{path, branch: .head_branch, event, conclusion, sha: .head_sha}')
+          echo "$info"
+          path=$(echo "$info" | jq -r .path)
+          branch=$(echo "$info" | jq -r .branch)
+          event=$(echo "$info" | jq -r .event)
+          conclusion=$(echo "$info" | jq -r .conclusion)
+          [ "$path" = ".github/workflows/cdl_main.yml" ] || { echo "::error::REJECTED - run ${CDL_RUN_ID} is not a CDL run ($path)"; exit 1; }
+          [ "$conclusion" = "success" ] || { echo "::error::REJECTED - CDL run ${CDL_RUN_ID} did not succeed ($conclusion): its images were never approved"; exit 1; }
+          [ "$branch" = "main" ] || { echo "::error::REJECTED - CDL run ${CDL_RUN_ID} ran on '$branch', not main"; exit 1; }
+          [ "$event" != "pull_request" ] || { echo "::error::REJECTED - pull-request runs never publish releases"; exit 1; }
+          echo "OK - CDL run ${CDL_RUN_ID} is a successful main delivery"
+
+      - name: Download the release manifest of that run
+        run: |
+          gh run download "$CDL_RUN_ID" -R "$GITHUB_REPOSITORY" -n release-manifest -D release \
+            || { echo "::error::REJECTED - run ${CDL_RUN_ID} has no release manifest (nothing was published)"; exit 1; }
+          cat release/release-manifest.json
+
+      - name: Log in to GHCR (read-only job token)
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: "Rule 3 - every image digest carries a valid signed attestation"
+        run: |
+          for ref in $(jq -r '.images[]' release/release-manifest.json); do
+            case "$ref" in (*@sha256:*) ;; (*) echo "::error::REJECTED - $ref is not pinned by digest"; exit 1;; esac
+            echo "Verifying provenance of $ref"
+            gh attestation verify "oci://${ref}" --repo "${GITHUB_REPOSITORY}" \
+              || { echo "::error::REJECTED - no valid attestation for $ref (unapproved image)"; exit 1; }
+          done
+          echo "OK - all images are approved, signed artifacts"
+
+      - name: Approved manifest summary
+        run: |
+          {
+            echo "## Authorized release"
+            echo "- Requested by: @${GITHUB_ACTOR}"
+            echo "- CDL run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${CDL_RUN_ID}"
+            echo '```json'
+            cat release/release-manifest.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: approved-manifest
+          path: release/release-manifest.json
+          retention-days: 90

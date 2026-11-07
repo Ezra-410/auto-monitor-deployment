@@ -1,0 +1,203 @@
+# =============================================================================
+# CDL · Stage 3 · BUILD -> SCAN -> PUBLISH -> SIGN
+# For each of the 4 auto-monitor images:
+#   1. build from the exact verified commit (never from a branch name)
+#   2. scan the FINAL image with Trivy (OS packages + libraries inside it)
+#   3. gate: fixable CRITICAL -> FAIL, nothing is pushed
+#   4. publish to GHCR with an immutable tag (sha-<commit>) - main only
+#   5. record the image DIGEST (sha256 of the content) + sign a provenance
+#      attestation ("this digest was built by this workflow from that commit")
+#   6. write release-manifest.json = the ONLY input the deployment accepts
+# =============================================================================
+name: CDL · build, scan & publish
+
+on:
+  workflow_call:
+    inputs:
+      source_sha:
+        type: string
+        required: true
+      publish:
+        type: boolean
+        required: true
+    secrets:
+      AUTO_MONITOR_PAT:
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  TRIVY_VERSION: "0.69.3"
+  TRIVY_SHA256: "1816b632dfe529869c740c0913e36bd1629cb7688bd5634f4a858c1d57c88b75"
+  REGISTRY: ghcr.io
+
+jobs:
+  image:
+    name: "Image · ${{ matrix.component }}"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false # show the scan result of every image
+      matrix:
+        component: [backend, agent, ws-gateway, frontend]
+    steps:
+      - name: Checkout deployment repo (security policy files)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout auto-monitor at the verified commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ vars.APP_REPO }}
+          ref: ${{ inputs.source_sha }}
+          token: ${{ secrets.AUTO_MONITOR_PAT }}
+          path: app
+          persist-credentials: false
+
+      - name: Install Trivy (checksum verified)
+        run: |
+          curl -sSfL -o trivy.tgz "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  trivy.tgz" | sha256sum -c -
+          tar xzf trivy.tgz trivy && sudo mv trivy /usr/local/bin/ && rm trivy.tgz
+
+      - name: Compute image name
+        id: name
+        env:
+          COMPONENT: ${{ matrix.component }}
+          SHA: ${{ inputs.source_sha }}
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"   # registry names must be lowercase
+          image="${REGISTRY}/${owner}/auto-monitor-${COMPONENT}"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "tag=${image}:sha-${SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Build image (from the verified commit only)
+        env:
+          COMPONENT: ${{ matrix.component }}
+          TAG: ${{ steps.name.outputs.tag }}
+          SHA: ${{ inputs.source_sha }}
+          APP_REPO: ${{ vars.APP_REPO }}
+        run: |
+          docker build \
+            --label "org.opencontainers.image.revision=${SHA}" \
+            --label "org.opencontainers.image.source=https://github.com/${APP_REPO}" \
+            --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -t "${TAG}" "app/${COMPONENT}"
+
+      - name: Scan image - full report
+        env:
+          TAG: ${{ steps.name.outputs.tag }}
+          COMPONENT: ${{ matrix.component }}
+        run: |
+          mkdir -p reports
+          trivy image --format table --output "reports/image-${COMPONENT}.txt" "${TAG}"
+          trivy image --format json  --output "reports/image-${COMPONENT}.json" "${TAG}"
+          cat "reports/image-${COMPONENT}.txt"
+
+      - name: Keep image scan report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: image-scan-${{ matrix.component }}
+          path: reports/
+          retention-days: 90
+
+      - name: Security gate - fixable CRITICAL blocks publication
+        env:
+          TAG: ${{ steps.name.outputs.tag }}
+        run: |
+          trivy image --severity CRITICAL --ignore-unfixed \
+            --ignorefile security/.trivyignore \
+            --exit-code 1 "${TAG}"
+          echo "Image passed the security gate"
+
+      - name: Not publishing (commit not on main / PR / non-main pipeline)
+        if: ${{ !inputs.publish }}
+        run: echo "::notice::Image built and scanned but NOT published (publish=false)"
+
+      - name: Log in to GHCR (short-lived job token, no stored password)
+        if: inputs.publish
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image and record its digest
+        if: inputs.publish
+        id: push
+        env:
+          TAG: ${{ steps.name.outputs.tag }}
+          IMAGE: ${{ steps.name.outputs.image }}
+          COMPONENT: ${{ matrix.component }}
+        run: |
+          docker push "${TAG}"
+          ref=$(docker inspect --format '{{index .RepoDigests 0}}' "${TAG}")
+          digest="${ref##*@}"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          mkdir -p digests
+          printf '{"component":"%s","image":"%s","digest":"%s","ref":"%s@%s"}\n' \
+            "${COMPONENT}" "${IMAGE}" "${digest}" "${IMAGE}" "${digest}" > "digests/${COMPONENT}.json"
+          cat "digests/${COMPONENT}.json"
+
+      - name: Sign provenance attestation (SLSA build provenance)
+        if: inputs.publish
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-name: ${{ steps.name.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Keep digest
+        if: inputs.publish
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: digest-${{ matrix.component }}
+          path: digests/
+          retention-days: 90
+
+  release_manifest:
+    name: Release manifest
+    needs: image
+    if: inputs.publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: digest-*
+          merge-multiple: true
+          path: digests
+
+      - name: Build release-manifest.json
+        env:
+          SHA: ${{ inputs.source_sha }}
+          APP_REPO: ${{ vars.APP_REPO }}
+        run: |
+          jq -s --arg sha "$SHA" --arg repo "$APP_REPO" \
+                --arg run "$GITHUB_RUN_ID" --arg actor "$GITHUB_ACTOR" \
+                --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{source_repo: $repo, source_sha: $sha, cdl_run_id: $run,
+              delivered_by: $actor, delivered_at: $at,
+              images: (map({key: .component, value: .ref}) | from_entries)}' \
+            digests/*.json > release-manifest.json
+          cat release-manifest.json
+          {
+            echo "## Release manifest (approved artifacts)"
+            echo '```json'
+            cat release-manifest.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-manifest
+          path: release-manifest.json
+          retention-days: 90

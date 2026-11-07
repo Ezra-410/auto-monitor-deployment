@@ -1,0 +1,147 @@
+# =============================================================================
+# CDL · Stage 2b · MISCONFIGURATION CHECK  (Infrastructure as Code security)
+# Scans BEFORE anything is created in the cloud:
+#   - terraform/            (this repo)  -> Checkov, Trivy config, tfsec
+#   - Dockerfiles + compose (auto-monitor at the delivered commit) -> Checkov, Trivy
+# Policy : Checkov  -> any failed check            = FAIL
+#          Trivy    -> HIGH / CRITICAL               = FAIL
+#          tfsec    -> HIGH / CRITICAL               = FAIL
+# Exceptions: inline "#checkov:skip=ID:reason", "#trivy:ignore:ID",
+#             "#tfsec:ignore:ID" + entry in docs/SECURITY-EXCEPTIONS.md
+#             (reviewed by CODEOWNERS - a removed rule is visible in the diff)
+# =============================================================================
+name: CDL · misconfig check
+
+on:
+  workflow_call:
+    inputs:
+      source_sha:
+        type: string
+        required: true
+    secrets:
+      AUTO_MONITOR_PAT:
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  CHECKOV_VERSION: "3.4.3"
+  TRIVY_VERSION: "0.69.3"
+  TRIVY_SHA256: "1816b632dfe529869c740c0913e36bd1629cb7688bd5634f4a858c1d57c88b75"
+  TFSEC_VERSION: "1.28.14"
+  TFSEC_SHA256: "a32d0799bbefababaa4fcd814da9f4d251cd932789590b99d1d5fcb89ace6f68"
+  TERRAFORM_VERSION: "1.9.8"
+
+jobs:
+  terraform:
+    name: Terraform fmt + validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+      - name: terraform fmt -check
+        working-directory: terraform
+        run: terraform fmt -check -recursive -diff
+      - name: terraform validate (no cloud credentials needed)
+        working-directory: terraform
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+
+  iac-scan:
+    name: Checkov + Trivy + tfsec
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout auto-monitor at the delivered commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ vars.APP_REPO }}
+          ref: ${{ inputs.source_sha }}
+          token: ${{ secrets.AUTO_MONITOR_PAT }}
+          path: app
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Install scanners (versions pinned, binaries sha256-verified)
+        run: |
+          pip install -q "checkov==${CHECKOV_VERSION}"
+          curl -sSfL -o trivy.tgz "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  trivy.tgz" | sha256sum -c -
+          tar xzf trivy.tgz trivy && sudo mv trivy /usr/local/bin/
+          curl -sSfL -o tfsec "https://github.com/aquasecurity/tfsec/releases/download/v${TFSEC_VERSION}/tfsec-linux-amd64"
+          echo "${TFSEC_SHA256}  tfsec" | sha256sum -c -
+          chmod +x tfsec && sudo mv tfsec /usr/local/bin/
+          rm -f trivy.tgz
+          checkov --version; trivy --version | head -1; tfsec --version
+
+      - name: Checkov - Terraform
+        id: checkov_tf
+        run: |
+          mkdir -p reports
+          checkov -d terraform --framework terraform --quiet --compact \
+            -o cli -o junitxml -o sarif --output-file-path console,reports/checkov-terraform.xml,reports/checkov-terraform.sarif
+
+      - name: Checkov - Dockerfiles
+        id: checkov_docker
+        if: always()
+        run: |
+          checkov -d app --framework dockerfile --quiet --compact \
+            -o cli -o junitxml --output-file-path console,reports/checkov-docker.xml
+
+      - name: Trivy config - Terraform + Dockerfiles (HIGH/CRITICAL block)
+        id: trivy_config
+        if: always()
+        run: |
+          trivy config --format table --output reports/trivy-config.txt terraform
+          trivy config --format table --output reports/trivy-config-app.txt app
+          cat reports/trivy-config.txt reports/trivy-config-app.txt
+          trivy config --severity HIGH,CRITICAL --exit-code 1 terraform
+          trivy config --severity HIGH,CRITICAL --exit-code 1 app
+
+      - name: tfsec - Terraform (HIGH/CRITICAL block)
+        id: tfsec
+        if: always()
+        run: |
+          tfsec terraform --no-color --format default,junit --out reports/tfsec --minimum-severity HIGH
+          echo "tfsec passed"
+
+      - name: Comparison summary
+        if: always()
+        env:
+          R_CK_TF: ${{ steps.checkov_tf.outcome }}
+          R_CK_DK: ${{ steps.checkov_docker.outcome }}
+          R_TRIVY: ${{ steps.trivy_config.outcome }}
+          R_TFSEC: ${{ steps.tfsec.outcome }}
+        run: |
+          {
+            echo "## IaC / misconfiguration scan"
+            echo "| Scanner | Scope | Result |"
+            echo "|---|---|---|"
+            echo "| Checkov | terraform/ | ${R_CK_TF} |"
+            echo "| Checkov | Dockerfiles | ${R_CK_DK} |"
+            echo "| Trivy config | terraform/ + Dockerfiles | ${R_TRIVY} |"
+            echo "| tfsec | terraform/ | ${R_TFSEC} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep IaC reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: iac-scan-report
+          path: reports/
+          retention-days: 90

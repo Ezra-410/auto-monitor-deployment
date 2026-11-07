@@ -1,0 +1,9 @@
+# runtime files written by the pipeline - never commit
+deploy/.env
+deploy/init.sql
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+.terraform.lock.hcl.bak
+reports/

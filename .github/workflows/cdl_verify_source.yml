@@ -1,0 +1,99 @@
+# =============================================================================
+# CDL · Stage 1 · VERIFY SOURCE
+# "Only approved source revisions may be delivered."
+#   - resolve the requested ref to an exact commit SHA (immutable)
+#   - refuse delivery unless the auto-monitor CI (ci_main.yml) PASSED for
+#     that exact commit
+#   - tell later stages whether the commit is part of main (publishable)
+#   - download the CI test reports as delivery evidence
+# Uses AUTO_MONITOR_PAT: fine-grained PAT, READ-ONLY (Contents + Actions)
+# on auto-monitor only, short expiry -> rotated regularly.
+# =============================================================================
+name: CDL · verify source
+
+on:
+  workflow_call:
+    inputs:
+      source_ref:
+        type: string
+        required: true
+    secrets:
+      AUTO_MONITOR_PAT:
+        required: true
+    outputs:
+      source_sha:
+        description: "Exact auto-monitor commit being delivered"
+        value: ${{ jobs.verify.outputs.source_sha }}
+      on_main:
+        description: "true if the commit is contained in auto-monitor main"
+        value: ${{ jobs.verify.outputs.on_main }}
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: CI passed for this commit?
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      source_sha: ${{ steps.resolve.outputs.sha }}
+      on_main: ${{ steps.branch.outputs.on_main }}
+    env:
+      GH_TOKEN: ${{ secrets.AUTO_MONITOR_PAT }}
+      APP_REPO: ${{ vars.APP_REPO }}
+      SOURCE_REF: ${{ inputs.source_ref }}
+    steps:
+      - name: Resolve ref to an exact commit SHA
+        id: resolve
+        run: |
+          test -n "$APP_REPO" || { echo "::error::Repository variable APP_REPO is not set"; exit 1; }
+          sha=$(gh api "repos/${APP_REPO}/commits/${SOURCE_REF}" --jq .sha)
+          echo "Delivering ${APP_REPO}@${sha} (requested: ${SOURCE_REF})"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Require a successful CI run for this exact commit
+        id: ci
+        env:
+          SHA: ${{ steps.resolve.outputs.sha }}
+        run: |
+          run_id=$(gh api "repos/${APP_REPO}/actions/workflows/ci_main.yml/runs?head_sha=${SHA}&status=success&per_page=1" \
+                   --jq '.workflow_runs[0].id // empty')
+          if [ -z "$run_id" ]; then
+            echo "::error::REJECTED - no successful CI run (ci_main.yml) for ${SHA}. Untested code is never delivered."
+            exit 1
+          fi
+          echo "CI run ${run_id} succeeded for ${SHA}"
+          echo "run_id=${run_id}" >> "$GITHUB_OUTPUT"
+
+      - name: Is the commit part of auto-monitor main?
+        id: branch
+        env:
+          SHA: ${{ steps.resolve.outputs.sha }}
+        run: |
+          status=$(gh api "repos/${APP_REPO}/compare/main...${SHA}" --jq .status)
+          if [ "$status" = "identical" ] || [ "$status" = "behind" ]; then
+            echo "on_main=true" >> "$GITHUB_OUTPUT"
+            echo "Commit is on main -> eligible for publication"
+          else
+            echo "on_main=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Commit is NOT on main (${status}) -> it will be built and scanned but NEVER published"
+          fi
+
+      - name: Download CI test reports (evidence)
+        env:
+          RUN_ID: ${{ steps.ci.outputs.run_id }}
+        run: |
+          mkdir -p evidence
+          gh run download "$RUN_ID" -R "$APP_REPO" -p 'test-report-*' -D evidence/
+          gh api "repos/${APP_REPO}/actions/runs/${RUN_ID}" \
+            --jq '{run_id: .id, sha: .head_sha, branch: .head_branch, actor: .actor.login, conclusion, url: .html_url}' \
+            > evidence/ci-run.json
+          cat evidence/ci-run.json
+          find evidence -type f | head -50
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ci-evidence
+          path: evidence/
+          retention-days: 90

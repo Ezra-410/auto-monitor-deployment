@@ -1,0 +1,202 @@
+# =============================================================================
+# CDP · Stage 2/3 · DEPLOY to one environment (staging or production)
+#
+# The job is bound to a GitHub *environment*. That gives us, for free:
+#   - environment secrets: production secrets exist ONLY in this job
+#   - protection rules   : production = required reviewer + main branch only
+#   - audit trail        : Environments tab = who deployed what, when, approved by
+#
+# Target: "vars.DEPLOY_RUNNER" (default: a fresh GitHub-hosted VM, destroyed
+# after the job). Set it to "self-hosted" to deploy on your own machine.
+# In AWS, this job would assume the OIDC deployer role (terraform/iam_oidc.tf)
+# and send the same compose commands to the EC2 host through SSM.
+# =============================================================================
+name: CDP · deploy
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        required: true
+      simulate_failure:
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: "Deploy → ${{ inputs.environment }}"
+    runs-on: ${{ vars.DEPLOY_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 30
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ vars.PUBLIC_URL }}
+    permissions:
+      contents: read
+      actions: read
+      packages: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TARGET: ${{ inputs.environment }}
+      COMPOSE_PROJECT_NAME: auto-monitor-${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Get the approved manifest (from the authorize stage)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: approved-manifest
+          path: release
+
+      - name: Fetch postgres/init.sql from the released commit
+        env:
+          APP_REPO: ${{ vars.APP_REPO }}
+          AUTO_MONITOR_PAT: ${{ secrets.AUTO_MONITOR_PAT }}
+        run: |
+          sha=$(jq -r .source_sha release/release-manifest.json)
+          GH_TOKEN="${AUTO_MONITOR_PAT}" gh api "repos/${APP_REPO}/contents/postgres/init.sql?ref=${sha}" \
+            -H "Accept: application/vnd.github.raw" > deploy/init.sql
+          echo "init.sql taken from ${APP_REPO}@${sha}"
+
+      - name: Write runtime configuration (secrets never echoed, file mode 600)
+        env:
+          MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
+          MYSQL_ROOT_PASSWORD: ${{ secrets.MYSQL_ROOT_PASSWORD }}
+          PG_PASSWORD: ${{ secrets.PG_PASSWORD }}
+          INTERNAL_API_TOKEN: ${{ secrets.INTERNAL_API_TOKEN }}
+          JWT_PRIVATE_KEY: ${{ secrets.JWT_PRIVATE_KEY }}
+          ENCRYPTION_KEY: ${{ secrets.ENCRYPTION_KEY }}
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+          PUBLIC_URL: ${{ vars.PUBLIC_URL }}
+          PUBLIC_WS_URL: ${{ vars.PUBLIC_WS_URL }}
+          SIMULATE_FAILURE: ${{ inputs.simulate_failure }}
+        run: |
+          for v in MYSQL_PASSWORD MYSQL_ROOT_PASSWORD PG_PASSWORD INTERNAL_API_TOKEN JWT_PRIVATE_KEY ENCRYPTION_KEY ADMIN_PASSWORD; do
+            if [ -z "${!v}" ]; then
+              echo "::error::Secret $v is not available to environment '${TARGET}'"
+              exit 1
+            fi
+          done
+          backend_db_password="${MYSQL_PASSWORD}"
+          if [ "${SIMULATE_FAILURE}" = "true" ]; then
+            echo "::warning::SEC-10 - simulating a broken release (backend gets a wrong DB password)"
+            backend_db_password="wrong-password-on-purpose"
+          fi
+          umask 077
+          release=release/release-manifest.json
+          frontend_image=$(jq -r '.images.frontend' "$release")
+          backend_image=$(jq -r '.images.backend' "$release")
+          agent_image=$(jq -r '.images.agent' "$release")
+          ws_image=$(jq -r '.images["ws-gateway"]' "$release")
+          cat > deploy/.env <<EOF
+          FRONTEND_IMAGE=${frontend_image}
+          BACKEND_IMAGE=${backend_image}
+          AGENT_IMAGE=${agent_image}
+          WS_GATEWAY_IMAGE=${ws_image}
+          PG_USER=monitor
+          PG_PASSWORD=${PG_PASSWORD}
+          MYSQL_USER=monitor
+          MYSQL_PASSWORD=${MYSQL_PASSWORD}
+          BACKEND_DB_PASSWORD=${backend_db_password}
+          MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
+          INTERNAL_API_TOKEN=${INTERNAL_API_TOKEN}
+          JWT_PRIVATE_KEY=${JWT_PRIVATE_KEY}
+          ENCRYPTION_KEY=${ENCRYPTION_KEY}
+          ADMIN_USERNAME=admin
+          ADMIN_PASSWORD=${ADMIN_PASSWORD}
+          LLM_PROVIDER=mock
+          PUBLIC_URL=${PUBLIC_URL:-http://localhost:3000}
+          PUBLIC_WS_URL=${PUBLIC_WS_URL:-ws://localhost:4000}
+          EOF
+          grep -E '_IMAGE=' deploy/.env
+
+      - name: Log in to GHCR (read-only job token)
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull approved images BY DIGEST (content cannot be swapped)
+        working-directory: deploy
+        run: docker compose --env-file .env pull --quiet
+
+      - name: Start the stack and wait until every service is healthy
+        id: up
+        working-directory: deploy
+        run: docker compose --env-file .env up -d --wait --wait-timeout 420
+
+      - name: Smoke test
+        id: smoke
+        working-directory: deploy
+        env:
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+        run: bash smoke-test.sh
+
+      - name: Verify running images = approved digests
+        working-directory: deploy
+        run: |
+          for svc in frontend backend agent ws-gateway; do
+            running=$(docker inspect --format '{{.Config.Image}}' "$(docker compose --env-file .env ps -q "$svc")")
+            echo "$svc -> $running"
+            grep -q "$running" ../release/release-manifest.json \
+              || { echo "::error::$svc runs an image that is not in the approved manifest"; exit 1; }
+          done
+          echo "OK - every running container uses an approved digest"
+
+      - name: Record deployment (audit evidence)
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          jq --arg env "$ENVIRONMENT" --arg run "$GITHUB_RUN_ID" \
+             --arg actor "$GITHUB_ACTOR" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+             '. + {environment: $env, cdp_run_id: $run, deployed_by: $actor, deployed_at: $at, status: "success"}' \
+             release/release-manifest.json > "deployed-${ENVIRONMENT}.json"
+          cat "deployed-${ENVIRONMENT}.json"
+          {
+            echo "## Deployed to ${ENVIRONMENT}"
+            echo '```json'; cat "deployed-${ENVIRONMENT}.json"; echo '```'
+            echo "Approval history: Settings → Environments → ${ENVIRONMENT} / repo Deployments page"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep deployment record
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: deployed-${{ inputs.environment }}
+          path: deployed-${{ inputs.environment }}.json
+          retention-days: 90
+
+      # ---------------- failure handling (SEC-10) ----------------
+      - name: Collect diagnostics
+        if: failure()
+        working-directory: deploy
+        run: |
+          mkdir -p ../diagnostics
+          docker compose --env-file .env ps -a > ../diagnostics/ps.txt 2>&1
+          docker compose --env-file .env logs --no-color --tail 200 > ../diagnostics/logs.txt 2>&1
+          cat ../diagnostics/ps.txt
+
+      - name: Keep diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: diagnostics-${{ inputs.environment }}
+          path: diagnostics/
+          retention-days: 30
+
+      - name: Roll back to the last known-good release
+        if: failure()
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+        run: bash deploy/rollback.sh "$ENVIRONMENT"
+
+      - name: Tear down (GitHub-hosted runner only)
+        if: always() && runner.environment == 'github-hosted'
+        working-directory: deploy
+        run: docker compose --env-file .env down -v --remove-orphans

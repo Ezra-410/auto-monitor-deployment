@@ -1,0 +1,150 @@
+# =============================================================================
+# auto-monitor - DEPLOYMENT compose file
+# Differences with the developer compose file (auto-monitor/docker-compose.yml):
+#   - NO "build:" -> production never builds, it runs APPROVED images only,
+#     referenced BY DIGEST (image@sha256:...) from the release manifest
+#   - secrets come from the environment-scoped .env written by the pipeline
+#   - app containers: no-new-privileges + all Linux capabilities dropped
+#   - only the frontend (3000) and ws-gateway (4000) are published, on localhost
+#   - start-up order fixed (agent no longer waits for a healthy backend)
+# =============================================================================
+name: auto-monitor
+
+x-hardening: &hardening
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: ["ALL"]
+  restart: unless-stopped
+
+networks:
+  monitor-net: {}
+
+volumes:
+  pg-data: {}
+  mysql-data: {}
+  repos-data: {}
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      POSTGRES_DB: agent_memory
+      POSTGRES_USER: ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks: [monitor-net]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB && psql -U $$POSTGRES_USER -d $$POSTGRES_DB -tAc 'SELECT 1 FROM agent_state LIMIT 1' >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      MYSQL_DATABASE: monitor
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    volumes:
+      - mysql-data:/var/lib/mysql
+    networks: [monitor-net]
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 40s
+
+  backend:
+    <<: *hardening
+    image: ${BACKEND_IMAGE:?release manifest missing backend digest}
+    depends_on:
+      mysql: { condition: service_healthy }
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/monitor
+      SPRING_DATASOURCE_USERNAME: ${MYSQL_USER}
+      SPRING_DATASOURCE_PASSWORD: ${BACKEND_DB_PASSWORD}
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
+      JWT_PRIVATE_KEY: ${JWT_PRIVATE_KEY}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD must be set}
+      AGENT_URL: http://agent:8000
+      WS_URL: http://ws-gateway:4000
+    networks: [monitor-net]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/actuator/health/readiness | grep -q UP"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+
+  agent:
+    <<: *hardening
+    image: ${AGENT_IMAGE:?release manifest missing agent digest}
+    depends_on:
+      postgres: { condition: service_healthy }
+      backend: { condition: service_started }
+    environment:
+      PG_DSN: postgresql://${PG_USER}:${PG_PASSWORD}@postgres:5432/agent_memory
+      BACKEND_URL: http://backend:8080
+      WS_URL: http://ws-gateway:4000
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      REPOS_DIR: /data/repos
+    volumes:
+      - repos-data:/data/repos
+    networks: [monitor-net]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  ws-gateway:
+    <<: *hardening
+    image: ${WS_GATEWAY_IMAGE:?release manifest missing ws-gateway digest}
+    depends_on:
+      backend: { condition: service_healthy }
+    environment:
+      PORT: 4000
+      BACKEND_URL: http://backend:8080
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
+      ALLOWED_ORIGIN: ${PUBLIC_URL}
+    ports:
+      - "127.0.0.1:4000:4000"
+    networks: [monitor-net]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:4000/readyz >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  frontend:
+    <<: *hardening
+    image: ${FRONTEND_IMAGE:?release manifest missing frontend digest}
+    depends_on:
+      backend: { condition: service_healthy }
+      ws-gateway: { condition: service_healthy }
+    environment:
+      NUXT_BACKEND_URL: http://backend:8080
+      NUXT_WS_INTERNAL_URL: http://ws-gateway:4000
+      NUXT_PUBLIC_WS_URL: ${PUBLIC_WS_URL}
+    ports:
+      - "127.0.0.1:3000:3000"
+    networks: [monitor-net]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/api/_health >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
