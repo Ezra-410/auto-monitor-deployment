@@ -4,3 +4,8 @@
 #   CVE-0000-00000 exp:2026-12-31
 #   # reason: ... - approved by @Ezra-410 on 2026-11-07
 # =============================================================================
+# EXC-09 - spring-webmvc 6.2.x: fixes exist only in Spring Framework 7.0.9 (Spring Boot 4, major migration).
+# Compensating controls: backend not exposed (internal network only, behind Nuxt proxy + WAF in AWS).
+# Plan: migrate to Spring Boot 4 before expiry. Approved by @Ezra-410 on 2026-11-07.
+CVE-2026-47884 exp:2026-12-31
+CVE-2026-47890 exp:2026-12-31
